@@ -1,0 +1,270 @@
+name: Build PS1 Handheld APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Write project files
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
+          }
+          rootProject.name = "PS1Handheld"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "app.ps1handheld"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "app.ps1handheld"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "0.1"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+              packaging { jniLibs { useLegacyPackaging = true; pickFirsts += "**/libc++_shared.so" } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.github.swordfish90:libretrodroid:master-SNAPSHOT")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+              <application android:label="PS1 Handheld" android:theme="@style/Theme.AppCompat.NoActionBar" android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/app/ps1handheld
+          cat > app/src/main/java/app/ps1handheld/MainActivity.kt <<'EOF'
+          package app.ps1handheld
+
+          import android.app.ActivityManager
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import com.swordfish.libretrodroid.GLRetroView
+          import com.swordfish.libretrodroid.GLRetroViewData
+          import java.io.File
+
+          class MainActivity : AppCompatActivity() {
+              private var retro: GLRetroView? = null
+              private lateinit var shelf: LinearLayout
+              private lateinit var topBox: FrameLayout
+              private val dp get() = resources.displayMetrics.density
+              private val games get() = File(filesDir, "games")
+              private val addGame = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { copyIn(it, true) }
+              private val addBios = registerForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) copyIn(listOf(u), false) }
+
+              private fun shape(c1: Int, c2: Int = c1, r: Float = 16f) =
+                  GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(c1, c2)).apply { cornerRadius = r * dp }
+              private fun gap(w: Int, h: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(w, h) }
+              private fun row(vararg v: View) = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; v.forEach { addView(it) } }
+              private fun col(vararg v: View) = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; v.forEach { addView(it) } }
+
+              private fun key(t: String, code: Int, w: Int, h: Int, r: Float = 10f): View = TextView(this).apply {
+                  text = t; gravity = Gravity.CENTER; textSize = 15f; typeface = Typeface.DEFAULT_BOLD
+                  setTextColor(0xFF26414F.toInt()); background = shape(0xFFEEF2F4.toInt(), 0xFFB4BEC5.toInt(), r)
+                  layoutParams = LinearLayout.LayoutParams(w, h)
+                  setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { v.alpha = .65f; retro?.sendKeyEvent(KeyEvent.ACTION_DOWN, code) }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { v.alpha = 1f; retro?.sendKeyEvent(KeyEvent.ACTION_UP, code) }
+                      }
+                      true
+                  }
+              }
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t; textSize = 14f; setTextColor(0xFF1D2B34.toInt()); val p = (10 * dp).toInt(); setPadding(p, p, p, p)
+              }
+
+              private fun tile(t: String, f: () -> Unit) = label(t).apply {
+                  background = shape(Color.WHITE, 0xFFF1F6F9.toInt(), 12f); gravity = Gravity.CENTER; setOnClickListener { f() }
+                  layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(6, 6, 6, 6) }
+              }
+
+              private fun name(u: Uri): String =
+                  contentResolver.query(u, null, null, null, null)?.use { c ->
+                      if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
+                  } ?: "file"
+
+              private fun copyIn(us: List<Uri>, game: Boolean) {
+                  if (us.isEmpty()) return
+                  Toast.makeText(this, "Copying...", Toast.LENGTH_SHORT).show()
+                  Thread {
+                      try {
+                          val names = us.map { name(it) }
+                          val dir = if (game) File(games, names[0].substringBeforeLast('.')) else File(filesDir, "system")
+                          dir.mkdirs()
+                          us.forEachIndexed { i, u ->
+                              contentResolver.openInputStream(u)!!.use { ins -> File(dir, names[i]).outputStream().use { ins.copyTo(it) } }
+                          }
+                          runOnUiThread { refresh(); Toast.makeText(this, "Added", Toast.LENGTH_SHORT).show() }
+                      } catch (e: Exception) {
+                          runOnUiThread { Toast.makeText(this, "Copy failed: ${e.message}", Toast.LENGTH_LONG).show() }
+                      }
+                  }.start()
+              }
+
+              private fun refresh() {
+                  shelf.removeAllViews()
+                  val gl = (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).deviceConfigurationInfo.glEsVersion
+                  val soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL else Build.HARDWARE
+                  shelf.addView(label("Chip: $soc  |  OpenGL ES $gl").apply { textSize = 12f })
+                  shelf.addView(row(tile("+ Game") { addGame.launch(arrayOf("*/*")) }, tile("+ BIOS (optional)") { addBios.launch(arrayOf("*/*")) }))
+                  val items = games.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }.orEmpty()
+                  if (items.isEmpty()) shelf.addView(label("No games yet.\nTap + Game and pick a .chd, .pbp or .iso (or a .cue plus its .bin files). Long-press a game to delete it."))
+                  items.forEach { d ->
+                      shelf.addView(label("▶  " + d.name).apply {
+                          background = shape(Color.WHITE, 0xFFF1F6F9.toInt(), 12f)
+                          layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(6, 6, 6, 6) }
+                          setOnClickListener { play(d) }
+                          setOnLongClickListener { d.deleteRecursively(); refresh(); true }
+                      })
+                  }
+              }
+
+              private fun play(d: File) {
+                  val order = listOf("cue", "chd", "pbp", "iso", "img", "bin")
+                  val f = d.listFiles()?.filter { it.isFile }
+                      ?.minByOrNull { order.indexOf(it.extension.lowercase()).let { i -> if (i < 0) 99 else i } } ?: return
+                  intent.putExtra("game", f.absolutePath); recreate()
+              }
+
+              private fun home() { intent.removeExtra("game"); recreate() }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val w = resources.displayMetrics.widthPixels
+                  val u = (w / 10.5f).toInt(); val tw = (w * .86f).toInt(); val th = tw * 3 / 5; val pad = w / 40
+                  val r = u / 2f / dp
+                  topBox = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                  val upper = FrameLayout(this).apply {
+                      background = shape(0xFF262E34.toInt(), 0xFF0C1013.toInt(), 26f); setPadding(pad, pad, pad, pad)
+                      addView(topBox, FrameLayout.LayoutParams(-1, th))
+                  }
+                  val hinge = View(this).apply {
+                      background = shape(0xFF4A545C.toInt(), 0xFF171C20.toInt(), 5f)
+                      layoutParams = LinearLayout.LayoutParams(-1, (14 * dp).toInt()).apply { setMargins(w / 10, 0, w / 10, 0) }
+                  }
+                  shelf = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val screen = ScrollView(this).apply { background = shape(0xFFF3F8FB.toInt(), 0xFFD6E4EC.toInt(), 5f); addView(shelf) }
+                  val bezel = FrameLayout(this).apply {
+                      background = shape(Color.BLACK, Color.BLACK, 12f); setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
+                      addView(screen, FrameLayout.LayoutParams(-1, th))
+                  }
+                  val dpad = col(
+                      row(gap(u, u), key("▲", KeyEvent.KEYCODE_DPAD_UP, u, u), gap(u, u)),
+                      row(key("◀", KeyEvent.KEYCODE_DPAD_LEFT, u, u), gap(u, u), key("▶", KeyEvent.KEYCODE_DPAD_RIGHT, u, u)),
+                      row(gap(u, u), key("▼", KeyEvent.KEYCODE_DPAD_DOWN, u, u), gap(u, u)))
+                  val face = col(
+                      row(gap(u, u), key("△", KeyEvent.KEYCODE_BUTTON_Y, u, u, r), gap(u, u)),
+                      row(key("□", KeyEvent.KEYCODE_BUTTON_X, u, u, r), gap(u, u), key("○", KeyEvent.KEYCODE_BUTTON_B, u, u, r)),
+                      row(gap(u, u), key("✕", KeyEvent.KEYCODE_BUTTON_A, u, u, r), gap(u, u)))
+                  val homeBtn = label("⌂ Home").apply {
+                      gravity = Gravity.CENTER; background = shape(0xFFEEF2F4.toInt(), 0xFFB4BEC5.toInt(), 20f)
+                      layoutParams = LinearLayout.LayoutParams(u * 2, u * 2 / 3); setOnClickListener { home() }
+                  }
+                  val mid = col(
+                      key("Start", KeyEvent.KEYCODE_BUTTON_START, u * 2, u * 2 / 3, 20f), gap(1, u / 3),
+                      key("Select", KeyEvent.KEYCODE_BUTTON_SELECT, u * 2, u * 2 / 3, 20f), gap(1, u / 3), homeBtn)
+                  val shoulders = row(key("L", KeyEvent.KEYCODE_BUTTON_L1, w / 4, u * 2 / 3, 14f), gap(w / 3, 1),
+                      key("R", KeyEvent.KEYCODE_BUTTON_R1, w / 4, u * 2 / 3, 14f))
+                  val deck = row(dpad, gap(u / 2, 1), mid, gap(u / 2, 1), face).apply { gravity = Gravity.CENTER }
+                  val lower = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                      background = shape(0xFF262E34.toInt(), 0xFF0C1013.toInt(), 26f); setPadding(pad, pad, pad, pad)
+                      addView(shoulders); addView(gap(1, pad)); addView(bezel); addView(gap(1, pad * 2)); addView(deck)
+                  }
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(w / 60, w / 30, w / 60, w / 30)
+                      addView(upper); addView(hinge); addView(lower)
+                  }
+                  setContentView(ScrollView(this).apply {
+                      isFillViewport = true; background = shape(0xFF63CDF4.toInt(), 0xFF1B8FC2.toInt(), 0f); addView(root)
+                  })
+                  refresh()
+                  intent.getStringExtra("game")?.let { path ->
+                      try {
+                          val core = File(applicationInfo.nativeLibraryDir, "libpcsx_rearmed_libretro_android.so")
+                          if (!core.exists()) throw IllegalStateException("core file missing")
+                          val sys = File(filesDir, "system").apply { mkdirs() }
+                          val sav = File(filesDir, "saves").apply { mkdirs() }
+                          val data = GLRetroViewData(this).apply {
+                              coreFilePath = core.absolutePath; gameFilePath = path
+                              systemDirectory = sys.absolutePath; savesDirectory = sav.absolutePath
+                          }
+                          retro = GLRetroView(this, data).also { lifecycle.addObserver(it); topBox.addView(it, FrameLayout.LayoutParams(-1, -1)) }
+                      } catch (e: Throwable) {
+                          Toast.makeText(this, "Couldn't start: ${e.message}", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Fetch PCSX-ReARMed core
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          curl -fL -o core.zip https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/pcsx_rearmed_libretro_android.so.zip
+          unzip -o core.zip -d core
+          cp core/pcsx_rearmed_libretro_android.so app/src/main/jniLibs/arm64-v8a/libpcsx_rearmed_libretro_android.so
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PS1-Handheld-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
